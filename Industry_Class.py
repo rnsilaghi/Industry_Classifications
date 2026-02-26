@@ -14,7 +14,103 @@ from openpyxl import load_workbook
 WORKBOOK_PATH = Path(__file__).resolve().parent / "New_Industry Classifications.xlsx"
 SOURCE_SHEET = "Tab1"
 OUTPUT_SHEET = "FF49_Comparison"
+SUMMARY_SHEET = "FF49_Agreement"
 SIC49_URL = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Siccodes49.zip"
+
+DOMAIN_RULES: Dict[str, Dict[str, List[str]]] = {
+    "Technology": {
+        "very_strong": [
+            "semiconductor", "chip", "processor", "software", "cybersecurity", "cloud",
+        ],
+        "strong": [
+            "software", "saas", "internet", "data", "cloud", "semiconductor", "chip",
+            "electronic", "electronics", "hardware", "telecom", "network", "cyber",
+            "ai", "server", "processor", "memory", "storage", "digital", "it ",
+        ],
+        "medium": ["information", "platform", "infrastructure", "communications", "computing"],
+        "weak": ["components", "systems", "automation", "services"],
+    },
+    "Financials": {
+        "very_strong": ["banking", "insurance", "asset management", "investment services", "reit"],
+        "strong": [
+            "bank", "banking", "insurance", "finance", "financial", "credit", "lending",
+            "investment", "broker", "asset management", "reit", "mortgage", "clearing",
+        ],
+        "medium": ["payment processing", "transaction processing", "depository", "underwriting"],
+        "weak": ["capital", "portfolio", "transaction", "payment", "trust", "holdings"],
+    },
+    "Healthcare": {
+        "very_strong": ["biopharmaceutical", "biotech", "medical devices", "hospital"],
+        "strong": [
+            "health", "healthcare", "biopharmaceutical", "pharma", "drug", "medical",
+            "biotech", "hospital", "clinic", "dental", "therapeutic", "diagnostic",
+        ],
+        "medium": ["clinical", "life science", "laboratory", "genomics", "diagnostics"],
+        "weak": ["care", "devices", "wellness"],
+    },
+    "Energy": {
+        "very_strong": ["upstream", "exploration and production", "oil and gas"],
+        "strong": [
+            "oil", "gas", "petroleum", "fossil fuel", "coal", "energy", "drilling",
+            "upstream", "exploration", "pipeline", "refining",
+        ],
+        "medium": ["midstream", "downstream", "offshore", "natural gas", "lng"],
+        "weak": ["well", "field services"],
+    },
+    "Utilities": {
+        "very_strong": ["electric utilities", "gas utilities", "water utilities"],
+        "strong": ["utilities", "utility", "electric", "power", "water", "steam", "grid"],
+        "medium": ["transmission", "distribution", "generation"],
+        "weak": ["renewable", "municipal utility"],
+    },
+    "Real Estate": {
+        "very_strong": ["real estate investment trusts", "equity reits", "mortgage reits"],
+        "strong": ["real estate", "property", "reit", "rental", "leasing", "mortgage reit"],
+        "medium": ["property management", "realty", "commercial real estate"],
+        "weak": ["land", "estate"],
+    },
+    "Transportation": {
+        "very_strong": ["airline", "railroad", "shipping", "logistics", "freight"],
+        "strong": [
+            "transportation", "transport", "rail", "railroad", "airline", "airport",
+            "shipping", "cargo", "truck", "logistics", "warehouse", "freight", "marine",
+        ],
+        "medium": ["distribution center", "ground transport", "air transport", "port"],
+        "weak": ["infrastructure", "delivery"],
+    },
+    "Consumer": {
+        "very_strong": ["hospitality services", "food and beverage", "retail", "restaurants"],
+        "strong": [
+            "retail", "food", "beverage", "tobacco", "apparel", "restaurant", "hotel",
+            "hospitality", "leisure", "entertainment", "gaming", "consumer",
+        ],
+        "medium": ["household products", "travel services", "consumer products", "media"],
+        "weak": ["household", "stores", "travel", "content"],
+    },
+    "Industrials/Materials": {
+        "very_strong": ["industrial manufacturing", "aerospace and defense", "mining and mineral products"],
+        "strong": [
+            "industrial", "machinery", "chemical", "chemicals", "plastic", "rubber",
+            "metal", "mining", "mineral", "construction", "aerospace", "defense",
+            "equipment", "manufacturing",
+        ],
+        "medium": ["engineering", "capital goods", "building products", "paper", "packaging"],
+        "weak": ["materials", "services", "fabrication"],
+    },
+    "Public/Education": {
+        "very_strong": ["public administration", "educational services"],
+        "strong": ["public administration", "government", "education", "school", "university"],
+        "medium": ["public sector", "k 12", "higher education"],
+        "weak": ["municipal", "state"],
+    },
+}
+
+BUCKET_WEIGHTS: Dict[str, float] = {
+    "very_strong": 5.0,
+    "strong": 3.0,
+    "medium": 2.0,
+    "weak": 1.0,
+}
 
 
 def _clean_text(value: object) -> str:
@@ -27,6 +123,11 @@ def _normalize_label(value: object) -> str:
     text = _clean_text(value).lower()
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _join_text_parts(parts: List[object]) -> str:
+    return " ".join([_clean_text(p) for p in parts if _clean_text(p)])
+
 
 def parse_sic(value: object) -> Optional[int]:
     if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -143,23 +244,46 @@ def infer_domain(text: object) -> str:
     if not t:
         return "Unknown"
 
-    rules = [
-        ("Financials", ["bank", "insurance", "finance", "credit", "investment", "trading", "broker"]),
-        ("Real Estate", ["real estate", "reit", "rental", "leasing", "property"]),
-        ("Energy", ["oil", "gas", "petroleum", "coal", "energy", "drilling", "pipeline"]),
-        ("Utilities", ["utility", "electric", "power", "water", "steam"]),
-        ("Healthcare", ["health", "pharma", "drug", "medical", "biotech", "hospital", "dental"]),
-        ("Technology", ["software", "computer", "internet", "telecom", "semiconductor", "data", "electronics"]),
-        ("Transportation", ["transport", "rail", "airline", "shipping", "truck", "logistics", "warehouse"]),
-        ("Consumer", ["retail", "food", "beverage", "tobacco", "apparel", "restaurant", "hotel", "leisure", "entertainment"]),
-        ("Industrials/Materials", ["manufacturing", "machinery", "chemical", "metal", "paper", "construction", "industrial", "equipment"]),
-        ("Public/Education", ["public administration", "government", "education", "school"]),
-    ]
+    scores: Dict[str, float] = {}
+    hits: Dict[str, int] = {}
+    for domain, buckets in DOMAIN_RULES.items():
+        score = 0.0
+        hit_count = 0
+        for bucket, weight in BUCKET_WEIGHTS.items():
+            for kw in buckets.get(bucket, []):
+                if kw in t:
+                    score += weight
+                    hit_count += 1
+        scores[domain] = score
+        hits[domain] = hit_count
 
-    for domain, keywords in rules:
-        if any(k in t for k in keywords):
+    best_domain, best_score = max(scores.items(), key=lambda x: x[1])
+    if best_score <= 0:
+        return "Other"
+
+    # Secondary tie-break by number of matched keywords.
+    max_hits = max(hits.values())
+    hit_tied = [d for d, h in hits.items() if h == max_hits]
+    scored_tied = [d for d, s in scores.items() if s == best_score]
+    tied = [d for d in scored_tied if d in hit_tied] or scored_tied
+
+    # Tie-break by stronger lexical specificity for Technology and Healthcare over generic industrial terms.
+    priority = [
+        "Technology",
+        "Healthcare",
+        "Financials",
+        "Energy",
+        "Utilities",
+        "Real Estate",
+        "Transportation",
+        "Consumer",
+        "Industrials/Materials",
+        "Public/Education",
+    ]
+    for domain in priority:
+        if domain in tied:
             return domain
-    return "Other"
+    return best_domain
 
 
 def map_sic_to_ff49(base_df: pd.DataFrame, ff49_ranges: pd.DataFrame) -> pd.DataFrame:
@@ -193,8 +317,19 @@ def build_output(df: pd.DataFrame, ff49_ranges: pd.DataFrame) -> pd.DataFrame:
     out = map_sic_to_ff49(out, ff49_ranges)
 
     out["NAICS_Sector_Label"] = out["NAICS Code"].apply(naics_sector_from_code)
+    rbics_text = out.apply(
+        lambda r: _join_text_parts(
+            [
+                r.get("FR RBICS Name Sector"),
+                r.get("FR RBICS Name Subsector"),
+                r.get("FR RBICS Name Industry"),
+                r.get("FR RBICS Name Subindustry"),
+            ]
+        ),
+        axis=1,
+    )
     out["FF49_Domain"] = out["FF49_Industry"].apply(infer_domain)
-    out["RBICS_Domain"] = out["FR RBICS Name Sector"].apply(infer_domain)
+    out["RBICS_Domain"] = rbics_text.apply(infer_domain)
     out["NAICS_Domain"] = out["NAICS_Sector_Label"].apply(infer_domain)
 
     out["FF49_vs_RBICS_Domain_Match"] = out["FF49_Domain"] == out["RBICS_Domain"]
@@ -221,8 +356,29 @@ def build_agreement_table(out: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def build_predictor_table(out: pd.DataFrame) -> pd.DataFrame:
+    ff49_rbics = float(out["FF49_vs_RBICS_Domain_Match"].mean())
+    ff49_naics = float(out["FF49_vs_NAICS_Domain_Match"].mean())
+    rbics_naics = float(out["RBICS_vs_NAICS_Domain_Match"].mean())
+
+    scores = {
+        "FF49 (SIC-based)": (ff49_rbics + ff49_naics) / 2.0,
+        "RBICS": (ff49_rbics + rbics_naics) / 2.0,
+        "NAICS": (ff49_naics + rbics_naics) / 2.0,
+    }
+    best = max(scores, key=scores.get)
+
+    rows = [
+        {"Classification": "FF49 (SIC-based)", "Overlap_Score": round(scores["FF49 (SIC-based)"], 4), "Best_Predictor": best == "FF49 (SIC-based)"},
+        {"Classification": "RBICS", "Overlap_Score": round(scores["RBICS"], 4), "Best_Predictor": best == "RBICS"},
+        {"Classification": "NAICS", "Overlap_Score": round(scores["NAICS"], 4), "Best_Predictor": best == "NAICS"},
+    ]
+    return pd.DataFrame(rows)
+
+
 def write_results(workbook_path: Path, detailed: pd.DataFrame) -> None:
     agreement = build_agreement_table(detailed)
+    predictor = build_predictor_table(detailed)
 
     ff49_vs_rbics_cm = pd.crosstab(
         detailed["FF49_Industry"].fillna("Unmapped SIC"),
@@ -241,28 +397,36 @@ def write_results(workbook_path: Path, detailed: pd.DataFrame) -> None:
     wb = load_workbook(workbook_path)
     if OUTPUT_SHEET in wb.sheetnames:
         del wb[OUTPUT_SHEET]
-        wb.save(workbook_path)
+    if SUMMARY_SHEET in wb.sheetnames:
+        del wb[SUMMARY_SHEET]
+    wb.save(workbook_path)
 
     with pd.ExcelWriter(workbook_path, engine="openpyxl", mode="a", if_sheet_exists="overlay") as writer:
         detailed.to_excel(writer, sheet_name=OUTPUT_SHEET, index=False, startrow=0)
 
-        r = len(detailed) + 2
-        pd.DataFrame({"Section": ["Agreement Metrics"]}).to_excel(
-            writer, sheet_name=OUTPUT_SHEET, index=False, startrow=r, header=False
+        r = 0
+        pd.DataFrame({"Section": ["Best Predictor by Overlap"]}).to_excel(
+            writer, sheet_name=SUMMARY_SHEET, index=False, startrow=r, header=False
         )
-        agreement.to_excel(writer, sheet_name=OUTPUT_SHEET, index=False, startrow=r + 1)
+        predictor.to_excel(writer, sheet_name=SUMMARY_SHEET, index=False, startrow=r + 1)
+
+        r = r + 1 + len(predictor) + 2
+        pd.DataFrame({"Section": ["Agreement Metrics"]}).to_excel(
+            writer, sheet_name=SUMMARY_SHEET, index=False, startrow=r, header=False
+        )
+        agreement.to_excel(writer, sheet_name=SUMMARY_SHEET, index=False, startrow=r + 1)
 
         r = r + 1 + len(agreement) + 2
         pd.DataFrame({"Section": ["Confusion Matrix: FF49 vs RBICS Sector"]}).to_excel(
-            writer, sheet_name=OUTPUT_SHEET, index=False, startrow=r, header=False
+            writer, sheet_name=SUMMARY_SHEET, index=False, startrow=r, header=False
         )
-        ff49_vs_rbics_cm.to_excel(writer, sheet_name=OUTPUT_SHEET, startrow=r + 1)
+        ff49_vs_rbics_cm.to_excel(writer, sheet_name=SUMMARY_SHEET, startrow=r + 1)
 
         r = r + 1 + len(ff49_vs_rbics_cm) + 3
         pd.DataFrame({"Section": ["Confusion Matrix: FF49 vs NAICS Sector"]}).to_excel(
-            writer, sheet_name=OUTPUT_SHEET, index=False, startrow=r, header=False
+            writer, sheet_name=SUMMARY_SHEET, index=False, startrow=r, header=False
         )
-        ff49_vs_naics_cm.to_excel(writer, sheet_name=OUTPUT_SHEET, startrow=r + 1)
+        ff49_vs_naics_cm.to_excel(writer, sheet_name=SUMMARY_SHEET, startrow=r + 1)
 
 
 def main() -> None:
@@ -274,7 +438,7 @@ def main() -> None:
     detailed = build_output(base, ff49_ranges)
     write_results(WORKBOOK_PATH, detailed)
 
-    print(f"Wrote '{OUTPUT_SHEET}' in {WORKBOOK_PATH}")
+    print(f"Wrote '{OUTPUT_SHEET}' and '{SUMMARY_SHEET}' in {WORKBOOK_PATH}")
     print(f"Rows processed: {len(detailed)}")
     print(f"FF49 mapped rows: {int(detailed['FF49_Industry'].notna().sum())}")
 
