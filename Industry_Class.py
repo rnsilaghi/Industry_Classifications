@@ -28,24 +28,6 @@ def _normalize_label(value: object) -> str:
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
-
-def _token_set(value: object) -> set[str]:
-    txt = _normalize_label(value)
-    if not txt:
-        return set()
-    return set(txt.split())
-
-
-def token_overlap_score(left: object, right: object) -> float:
-    a = _token_set(left)
-    b = _token_set(right)
-    if not a or not b:
-        return 0.0
-    inter = len(a & b)
-    union = len(a | b)
-    return round(inter / union, 4) if union else 0.0
-
-
 def parse_sic(value: object) -> Optional[int]:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
@@ -219,16 +201,6 @@ def build_output(df: pd.DataFrame, ff49_ranges: pd.DataFrame) -> pd.DataFrame:
     out["FF49_vs_NAICS_Domain_Match"] = out["FF49_Domain"] == out["NAICS_Domain"]
     out["RBICS_vs_NAICS_Domain_Match"] = out["RBICS_Domain"] == out["NAICS_Domain"]
 
-    out["FF49_vs_RBICS_Text_Overlap"] = out.apply(
-        lambda r: token_overlap_score(r.get("FF49_Industry"), r.get("FR RBICS Name Industry")), axis=1
-    )
-    out["FF49_vs_NAICS_Text_Overlap"] = out.apply(
-        lambda r: token_overlap_score(r.get("FF49_Industry"), r.get("NAICS_Sector_Label")), axis=1
-    )
-
-    out["FF49_vs_RBICS_Match_Flag"] = out["FF49_vs_RBICS_Domain_Match"] | (out["FF49_vs_RBICS_Text_Overlap"] >= 0.25)
-    out["FF49_vs_NAICS_Match_Flag"] = out["FF49_vs_NAICS_Domain_Match"] | (out["FF49_vs_NAICS_Text_Overlap"] >= 0.25)
-
     return out
 
 
@@ -239,8 +211,6 @@ def build_agreement_table(out: pd.DataFrame) -> pd.DataFrame:
         "FF49 vs RBICS domain agreement": out["FF49_vs_RBICS_Domain_Match"].mean(),
         "FF49 vs NAICS domain agreement": out["FF49_vs_NAICS_Domain_Match"].mean(),
         "RBICS vs NAICS domain agreement": out["RBICS_vs_NAICS_Domain_Match"].mean(),
-        "FF49 vs RBICS logical match flag": out["FF49_vs_RBICS_Match_Flag"].mean(),
-        "FF49 vs NAICS logical match flag": out["FF49_vs_NAICS_Match_Flag"].mean(),
     }
     rows = []
     for k, v in metrics.items():
