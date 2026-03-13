@@ -12,10 +12,12 @@ from openpyxl import load_workbook
 
 
 WORKBOOK_PATH = Path(__file__).resolve().parent / "New_Industry Classifications.xlsx"
-SOURCE_SHEET = "Tab1"
-OUTPUT_SHEET = "FF49_Comparison"
-SUMMARY_SHEET = "FF49_Agreement"
+SOURCE_SHEET = "Raw Dataset"
+OUTPUT_SHEET = "FF_Comparison"
+SUMMARY_SHEET = "FF_Agreement"
+LEGACY_OUTPUT_SHEETS = ["FF49_Comparison", "FF49_Agreement"]
 SIC49_URL = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Siccodes49.zip"
+SIC17_URL = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Siccodes17.zip"
 
 DOMAIN_RULES: Dict[str, Dict[str, List[str]]] = {
     "Technology": {
@@ -112,6 +114,8 @@ BUCKET_WEIGHTS: Dict[str, float] = {
     "weak": 1.0,
 }
 
+REQUIRED_SOURCE_COLUMNS = ["Symbol", "SIC_CODES", "NAICS Code", "FR RBICS Name Sector"]
+
 
 def _clean_text(value: object) -> str:
     if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -129,6 +133,26 @@ def _join_text_parts(parts: List[object]) -> str:
     return " ".join([_clean_text(p) for p in parts if _clean_text(p)])
 
 
+def resolve_source_sheet(workbook_path: Path, preferred_sheet: str = SOURCE_SHEET) -> str:
+    wb = load_workbook(workbook_path, read_only=True)
+    sheetnames = wb.sheetnames
+
+    if preferred_sheet in sheetnames:
+        return preferred_sheet
+
+    for sheet in sheetnames:
+        if sheet in {OUTPUT_SHEET, SUMMARY_SHEET, *LEGACY_OUTPUT_SHEETS}:
+            continue
+        header = pd.read_excel(workbook_path, sheet_name=sheet, nrows=0)
+        if set(REQUIRED_SOURCE_COLUMNS).issubset(header.columns):
+            return sheet
+
+    raise ValueError(
+        f"Could not find a source sheet with required columns {REQUIRED_SOURCE_COLUMNS}. "
+        f"Available sheets: {sheetnames}"
+    )
+
+
 def parse_sic(value: object) -> Optional[int]:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
@@ -144,7 +168,7 @@ def parse_sic(value: object) -> Optional[int]:
     return num
 
 
-def load_ff49_sic_ranges(url: str = SIC49_URL) -> pd.DataFrame:
+def load_ff_sic_ranges(url: str, prefix: str) -> pd.DataFrame:
     response = requests.get(url, timeout=30)
     response.raise_for_status()
 
@@ -166,9 +190,9 @@ def load_ff49_sic_ranges(url: str = SIC49_URL) -> pd.DataFrame:
         header_match = header_re.match(line)
         if header_match:
             current = {
-                "FF49_Num": int(header_match.group(1)),
-                "FF49_Code": header_match.group(2).strip(),
-                "FF49_Industry": header_match.group(3).strip(),
+                f"{prefix}_Num": int(header_match.group(1)),
+                f"{prefix}_Code": header_match.group(2).strip(),
+                f"{prefix}_Industry": header_match.group(3).strip(),
             }
             continue
 
@@ -184,10 +208,18 @@ def load_ff49_sic_ranges(url: str = SIC49_URL) -> pd.DataFrame:
             )
 
     if not rows:
-        raise ValueError("Failed to parse SIC ranges from Ken French SIC49 file.")
+        raise ValueError(f"Failed to parse SIC ranges from Ken French {prefix} file.")
 
-    out = pd.DataFrame(rows).sort_values(["SIC_Start", "SIC_End", "FF49_Num"]).reset_index(drop=True)
+    out = pd.DataFrame(rows).sort_values(["SIC_Start", "SIC_End", f"{prefix}_Num"]).reset_index(drop=True)
     return out
+
+
+def load_ff49_sic_ranges(url: str = SIC49_URL) -> pd.DataFrame:
+    return load_ff_sic_ranges(url, "FF49")
+
+
+def load_ff17_sic_ranges(url: str = SIC17_URL) -> pd.DataFrame:
+    return load_ff_sic_ranges(url, "FF17")
 
 
 def naics_sector_from_code(naics_code: object) -> str:
@@ -286,35 +318,35 @@ def infer_domain(text: object) -> str:
     return best_domain
 
 
-def map_sic_to_ff49(base_df: pd.DataFrame, ff49_ranges: pd.DataFrame) -> pd.DataFrame:
-    interval_index = pd.IntervalIndex.from_arrays(ff49_ranges["SIC_Start"], ff49_ranges["SIC_End"], closed="both")
+def map_sic_to_ff(base_df: pd.DataFrame, ff_ranges: pd.DataFrame, prefix: str) -> pd.DataFrame:
+    interval_index = pd.IntervalIndex.from_arrays(ff_ranges["SIC_Start"], ff_ranges["SIC_End"], closed="both")
 
     def lookup(sic_num: Optional[int]) -> Dict[str, object]:
         if sic_num is None:
-            return {"FF49_Num": pd.NA, "FF49_Code": pd.NA, "FF49_Industry": pd.NA}
+            return {f"{prefix}_Num": pd.NA, f"{prefix}_Code": pd.NA, f"{prefix}_Industry": pd.NA}
         pos = interval_index.get_indexer([sic_num])[0]
         if pos == -1:
-            return {"FF49_Num": pd.NA, "FF49_Code": pd.NA, "FF49_Industry": pd.NA}
-        row = ff49_ranges.iloc[pos]
+            return {f"{prefix}_Num": pd.NA, f"{prefix}_Code": pd.NA, f"{prefix}_Industry": pd.NA}
+        row = ff_ranges.iloc[pos]
         return {
-            "FF49_Num": int(row["FF49_Num"]),
-            "FF49_Code": row["FF49_Code"],
-            "FF49_Industry": row["FF49_Industry"],
+            f"{prefix}_Num": int(row[f"{prefix}_Num"]),
+            f"{prefix}_Code": row[f"{prefix}_Code"],
+            f"{prefix}_Industry": row[f"{prefix}_Industry"],
         }
 
     mapped = base_df["SIC_Int"].apply(lookup).apply(pd.Series)
     return pd.concat([base_df, mapped], axis=1)
 
 
-def build_output(df: pd.DataFrame, ff49_ranges: pd.DataFrame) -> pd.DataFrame:
-    required = ["Symbol", "SIC_CODES", "NAICS Code", "FR RBICS Name Sector"]
-    missing = [c for c in required if c not in df.columns]
+def build_output(df: pd.DataFrame, ff49_ranges: pd.DataFrame, ff17_ranges: pd.DataFrame) -> pd.DataFrame:
+    missing = [c for c in REQUIRED_SOURCE_COLUMNS if c not in df.columns]
     if missing:
         raise KeyError(f"Missing required columns in '{SOURCE_SHEET}': {missing}")
 
     out = df.copy()
     out["SIC_Int"] = out["SIC_CODES"].apply(parse_sic)
-    out = map_sic_to_ff49(out, ff49_ranges)
+    out = map_sic_to_ff(out, ff49_ranges, "FF49")
+    out = map_sic_to_ff(out, ff17_ranges, "FF17")
 
     out["NAICS_Sector_Label"] = out["NAICS Code"].apply(naics_sector_from_code)
     rbics_text = out.apply(
@@ -329,11 +361,14 @@ def build_output(df: pd.DataFrame, ff49_ranges: pd.DataFrame) -> pd.DataFrame:
         axis=1,
     )
     out["FF49_Domain"] = out["FF49_Industry"].apply(infer_domain)
+    out["FF17_Domain"] = out["FF17_Industry"].apply(infer_domain)
     out["RBICS_Domain"] = rbics_text.apply(infer_domain)
     out["NAICS_Domain"] = out["NAICS_Sector_Label"].apply(infer_domain)
 
     out["FF49_vs_RBICS_Domain_Match"] = out["FF49_Domain"] == out["RBICS_Domain"]
     out["FF49_vs_NAICS_Domain_Match"] = out["FF49_Domain"] == out["NAICS_Domain"]
+    out["FF17_vs_RBICS_Domain_Match"] = out["FF17_Domain"] == out["RBICS_Domain"]
+    out["FF17_vs_NAICS_Domain_Match"] = out["FF17_Domain"] == out["NAICS_Domain"]
     out["RBICS_vs_NAICS_Domain_Match"] = out["RBICS_Domain"] == out["NAICS_Domain"]
 
     return out
@@ -343,8 +378,11 @@ def build_agreement_table(out: pd.DataFrame) -> pd.DataFrame:
     metrics = {
         "Rows": len(out),
         "FF49 coverage (non-null mapped SIC)": out["FF49_Industry"].notna().mean(),
+        "FF17 coverage (non-null mapped SIC)": out["FF17_Industry"].notna().mean(),
         "FF49 vs RBICS domain agreement": out["FF49_vs_RBICS_Domain_Match"].mean(),
         "FF49 vs NAICS domain agreement": out["FF49_vs_NAICS_Domain_Match"].mean(),
+        "FF17 vs RBICS domain agreement": out["FF17_vs_RBICS_Domain_Match"].mean(),
+        "FF17 vs NAICS domain agreement": out["FF17_vs_NAICS_Domain_Match"].mean(),
         "RBICS vs NAICS domain agreement": out["RBICS_vs_NAICS_Domain_Match"].mean(),
     }
     rows = []
@@ -359,17 +397,21 @@ def build_agreement_table(out: pd.DataFrame) -> pd.DataFrame:
 def build_predictor_table(out: pd.DataFrame) -> pd.DataFrame:
     ff49_rbics = float(out["FF49_vs_RBICS_Domain_Match"].mean())
     ff49_naics = float(out["FF49_vs_NAICS_Domain_Match"].mean())
+    ff17_rbics = float(out["FF17_vs_RBICS_Domain_Match"].mean())
+    ff17_naics = float(out["FF17_vs_NAICS_Domain_Match"].mean())
     rbics_naics = float(out["RBICS_vs_NAICS_Domain_Match"].mean())
 
     scores = {
         "FF49 (SIC-based)": (ff49_rbics + ff49_naics) / 2.0,
-        "RBICS": (ff49_rbics + rbics_naics) / 2.0,
-        "NAICS": (ff49_naics + rbics_naics) / 2.0,
+        "FF17 (SIC-based)": (ff17_rbics + ff17_naics) / 2.0,
+        "RBICS": (ff49_rbics + ff17_rbics + rbics_naics) / 3.0,
+        "NAICS": (ff49_naics + ff17_naics + rbics_naics) / 3.0,
     }
     best = max(scores, key=scores.get)
 
     rows = [
         {"Classification": "FF49 (SIC-based)", "Overlap_Score": round(scores["FF49 (SIC-based)"], 4), "Best_Predictor": best == "FF49 (SIC-based)"},
+        {"Classification": "FF17 (SIC-based)", "Overlap_Score": round(scores["FF17 (SIC-based)"], 4), "Best_Predictor": best == "FF17 (SIC-based)"},
         {"Classification": "RBICS", "Overlap_Score": round(scores["RBICS"], 4), "Best_Predictor": best == "RBICS"},
         {"Classification": "NAICS", "Overlap_Score": round(scores["NAICS"], 4), "Best_Predictor": best == "NAICS"},
     ]
@@ -394,11 +436,24 @@ def write_results(workbook_path: Path, detailed: pd.DataFrame) -> None:
         colnames=["NAICS_Sector"],
     )
 
+    ff17_vs_rbics_cm = pd.crosstab(
+        detailed["FF17_Industry"].fillna("Unmapped SIC"),
+        detailed["FR RBICS Name Sector"].fillna("Unknown RBICS"),
+        rownames=["FF17_Industry"],
+        colnames=["RBICS_Sector"],
+    )
+
+    ff17_vs_naics_cm = pd.crosstab(
+        detailed["FF17_Industry"].fillna("Unmapped SIC"),
+        detailed["NAICS_Sector_Label"].fillna("Unknown NAICS"),
+        rownames=["FF17_Industry"],
+        colnames=["NAICS_Sector"],
+    )
+
     wb = load_workbook(workbook_path)
-    if OUTPUT_SHEET in wb.sheetnames:
-        del wb[OUTPUT_SHEET]
-    if SUMMARY_SHEET in wb.sheetnames:
-        del wb[SUMMARY_SHEET]
+    for sheet_name in [OUTPUT_SHEET, SUMMARY_SHEET, *LEGACY_OUTPUT_SHEETS]:
+        if sheet_name in wb.sheetnames:
+            del wb[sheet_name]
     wb.save(workbook_path)
 
     with pd.ExcelWriter(workbook_path, engine="openpyxl", mode="a", if_sheet_exists="overlay") as writer:
@@ -428,19 +483,35 @@ def write_results(workbook_path: Path, detailed: pd.DataFrame) -> None:
         )
         ff49_vs_naics_cm.to_excel(writer, sheet_name=SUMMARY_SHEET, startrow=r + 1)
 
+        r = r + 1 + len(ff49_vs_naics_cm) + 3
+        pd.DataFrame({"Section": ["Confusion Matrix: FF17 vs RBICS Sector"]}).to_excel(
+            writer, sheet_name=SUMMARY_SHEET, index=False, startrow=r, header=False
+        )
+        ff17_vs_rbics_cm.to_excel(writer, sheet_name=SUMMARY_SHEET, startrow=r + 1)
+
+        r = r + 1 + len(ff17_vs_rbics_cm) + 3
+        pd.DataFrame({"Section": ["Confusion Matrix: FF17 vs NAICS Sector"]}).to_excel(
+            writer, sheet_name=SUMMARY_SHEET, index=False, startrow=r, header=False
+        )
+        ff17_vs_naics_cm.to_excel(writer, sheet_name=SUMMARY_SHEET, startrow=r + 1)
+
 
 def main() -> None:
     if not WORKBOOK_PATH.exists():
         raise FileNotFoundError(f"Workbook not found: {WORKBOOK_PATH}")
 
-    base = pd.read_excel(WORKBOOK_PATH, sheet_name=SOURCE_SHEET)
+    source_sheet = resolve_source_sheet(WORKBOOK_PATH)
+    base = pd.read_excel(WORKBOOK_PATH, sheet_name=source_sheet)
     ff49_ranges = load_ff49_sic_ranges()
-    detailed = build_output(base, ff49_ranges)
+    ff17_ranges = load_ff17_sic_ranges()
+    detailed = build_output(base, ff49_ranges, ff17_ranges)
     write_results(WORKBOOK_PATH, detailed)
 
     print(f"Wrote '{OUTPUT_SHEET}' and '{SUMMARY_SHEET}' in {WORKBOOK_PATH}")
+    print(f"Source sheet: {source_sheet}")
     print(f"Rows processed: {len(detailed)}")
     print(f"FF49 mapped rows: {int(detailed['FF49_Industry'].notna().sum())}")
+    print(f"FF17 mapped rows: {int(detailed['FF17_Industry'].notna().sum())}")
 
 
 if __name__ == "__main__":
